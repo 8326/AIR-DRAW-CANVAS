@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Air Drawing</title>
+<style>
+  body{margin:0;background:#111;font-family:Arial,Helvetica,sans-serif;color:#fff}
+  #wrap{position:relative;width:960px;max-width:100%;margin:70px auto 10px}
+  video,canvas{position:absolute;left:0;top:0;width:100%;height:auto;border-radius:10px;transform:scaleX(-1)}
+  #toolbar{position:fixed;top:10px;left:10px;right:10px;z-index:10;background:#222;padding:8px 12px;border-radius:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  button{background:#333;color:#fff;border:1px solid #555;border-radius:6px;padding:6px 12px;cursor:pointer}
+  button:hover{background:#444}
+  #status{margin-left:auto;font-size:14px;color:#9cf}
+  #error{position:fixed;top:60px;left:10px;right:10px;background:#511;color:#fbb;padding:10px;border-radius:8px;display:none;z-index:10}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1640029074/camera_utils.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div id="toolbar">
+  <input type="color" id="color" value="#ff0000">
+  <input type="range" id="size" min="2" max="30" value="6">
+  <label style="display:flex;align-items:center;gap:8px">Smooth
+    <input id="smoothing" type="range" min="0" max="0.95" step="0.01" value="0.6">
+  </label>
+  <label style="display:flex;align-items:center;gap:8px">Eraser size
+    <input id="eraserSize" type="range" min="10" max="120" value="40">
+  </label>
+  <button id="clear">Clear</button>
+  <button id="save">Save</button>
+  <span id="status">Loading hand tracking…</span>
+</div>
+
+<div id="error"></div>
+
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas" width="960" height="720"></canvas>
+</div>
+
+<script>
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const color = document.getElementById("color");
+const size = document.getElementById("size");
+const smoothingEl = document.getElementById("smoothing");
+const eraserSizeEl = document.getElementById("eraserSize");
+const statusEl = document.getElementById("status");
+const errorEl = document.getElementById("error");
+let prevSmoothed = null;
+let activeMode = null;
+let clearHoldStart = null;
+const CLEAR_HOLD_MS = 400;
+
+function resetTracking() {
+  prevSmoothed = null;
+}
+
+// Manual full clear stays as an explicit button click only —
+// there is no hand gesture that wipes the whole canvas anymore.
+document.getElementById("clear").onclick = () => ctx.clearRect(0, 0, canvas.width, canvas.height);
+document.getElementById("save").onclick = () => {
+  const a = document.createElement("a");
+  a.download = "drawing.png";
+  a.href = canvas.toDataURL();
+  a.click();
+};
+
+function showError(msg) {
+  errorEl.textContent = msg;
+  errorEl.style.display = "block";
+  statusEl.textContent = "Error";
+}
+
+if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+  showError(
+    "Camera API isn't available in this context. This page must be served " +
+    "over http://localhost or https:// — not opened as a file:// path. " +
+    "Run 'python -m http.server' in this folder and open http://localhost:8000, " +
+    "or use VS Code's Live Server extension."
+  );
+}
+
+function fingerUp(hand, tip, pip) {
+  return hand[tip].y < hand[pip].y;
+}
+
+const hands = new Hands({
+  locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}`
+});
+
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.7
+});
+
+hands.onResults((res) => {
+  statusEl.textContent = "Ready";
+
+  if (!res.multiHandLandmarks || !res.multiHandLandmarks.length) {
+    activeMode = null;
+    resetTracking();
+    statusEl.textContent = "Show your hand";
+    return;
+  }
+
+  const h = res.multiHandLandmarks[0];
+
+  const indexUp  = fingerUp(h, 8, 6);
+  const middleUp = fingerUp(h, 12, 10);
+  const ringUp   = fingerUp(h, 16, 14);
+  const pinkyUp  = fingerUp(h, 20, 18);
+
+  const p = h[8];
+  const x = p.x * canvas.width;
+  const y = p.y * canvas.height;
+
+  const isDrawing  = indexUp && !middleUp && !ringUp && !pinkyUp;
+  const isErasing  = indexUp && middleUp && !ringUp && !pinkyUp;
+  const isClearAll = indexUp && middleUp && ringUp && pinkyUp;
+  const nextMode = isDrawing ? "draw" : isErasing ? "erase" : isClearAll ? "clear" : "idle";
+
+  if (nextMode !== activeMode) {
+    activeMode = nextMode;
+    resetTracking();
+    if (nextMode !== "clear") clearHoldStart = null;
+  }
+
+  if (nextMode === "draw") {
+    statusEl.textContent = "Drawing";
+    ctx.globalCompositeOperation = "source-over";
+    ctx.strokeStyle = color.value;
+    ctx.lineWidth = Number(size.value);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+  } else if (nextMode === "erase") {
+    statusEl.textContent = "Erasing";
+    ctx.globalCompositeOperation = "destination-out";
+    ctx.strokeStyle = "rgba(0,0,0,1)";
+    ctx.lineWidth = Number(eraserSizeEl.value);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+  } else if (nextMode === "clear") {
+    const now = performance.now();
+    if (clearHoldStart === null) clearHoldStart = now;
+    const held = now - clearHoldStart;
+
+    if (held >= CLEAR_HOLD_MS) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      statusEl.textContent = "Cleared";
+      clearHoldStart = null;
+      activeMode = null; // force a fresh hold if the gesture is kept up
+    } else {
+      const pct = Math.round((held / CLEAR_HOLD_MS) * 0);
+      statusEl.textContent = `Hold to clear… ${pct}%`;
+    }
+    resetTracking();
+    return;
+  } else {
+    statusEl.textContent = "Paused";
+    resetTracking();
+    return;
+  }
+
+  const smoothFactor = parseFloat(smoothingEl.value);
+
+  if (prevSmoothed) {
+    const sx = prevSmoothed.x * smoothFactor + x * (1 - smoothFactor);
+    const sy = prevSmoothed.y * smoothFactor + y * (1 - smoothFactor);
+
+    ctx.beginPath();
+    ctx.moveTo(prevSmoothed.x, prevSmoothed.y);
+    ctx.lineTo(sx, sy);
+    ctx.stroke();
+
+    prevSmoothed = { x: sx, y: sy };
+  } else {
+    prevSmoothed = { x, y };
+  }
+});
+
+const cam = new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 960,
+  height: 720
+});
+
+cam.start().catch((err) => {
+  showError(
+    "Could not access the webcam: " + err.name + " — " + err.message + ". " +
+    "Check that camera permission is allowed for this site, that no other " +
+    "app is using the camera, and that you're on http://localhost or https://."
+  );
+});
+</script>
+</body>
+</html>
